@@ -1,0 +1,379 @@
+/**
+ * Vault State Manager for Secure Password Manager
+ * Orchestrates vault creation, unlocking, locking, CRUD operations, and security auditing.
+ */
+
+const VaultManager = {
+  // --- In-Memory State ---
+  derivedKey: null,      // The active CryptoKey object (cleared on lock)
+  isUnlocked: false,     // Vault status
+  rawDerivedKeyHex: "",  // Stored for the educational visualizer
+  activeSaltHex: "",     // Stored for the educational visualizer
+
+  // --- LocalStorage Keys ---
+  STORAGE_KEYS: {
+    VAULT_SALT: "sec_vault_salt",
+    VAULT_VERIFIER: "sec_vault_verifier",
+    VAULT_ITEMS: "sec_vault_items",
+    AUTO_LOCK_TIMEOUT: "sec_vault_autolock"
+  },
+
+  // --- Core Lifecycle ---
+
+  /**
+   * Checks if a vault already exists in LocalStorage.
+   */
+  vaultExists() {
+    return localStorage.getItem(this.STORAGE_KEYS.VAULT_SALT) !== null &&
+           localStorage.getItem(this.STORAGE_KEYS.VAULT_VERIFIER) !== null;
+  },
+
+  /**
+   * Initializes a brand new vault.
+   */
+  async createVault(masterPassword) {
+    // 1. Generate salt and IV
+    const saltBuffer = CryptoEngine.generateSalt(16);
+    const verifierIV = CryptoEngine.generateIV(12);
+
+    // 2. Derive key from master password
+    const key = await CryptoEngine.deriveKey(masterPassword, saltBuffer);
+
+    // 3. Encrypt the verification token
+    const verifierToken = "Vault Verified!";
+    const encryptedVerifier = await CryptoEngine.encrypt(verifierToken, key, verifierIV);
+
+    // 4. Save to LocalStorage
+    localStorage.setItem(this.STORAGE_KEYS.VAULT_SALT, CryptoEngine.bufferToBase64(saltBuffer));
+    localStorage.setItem(
+      this.STORAGE_KEYS.VAULT_VERIFIER, 
+      JSON.stringify(encryptedVerifier)
+    );
+    localStorage.setItem(this.STORAGE_KEYS.VAULT_ITEMS, JSON.stringify([]));
+
+    // 5. Cache key and mark as unlocked
+    this.derivedKey = key;
+    this.isUnlocked = true;
+
+    // Cache visualization variables
+    this.rawDerivedKeyHex = await CryptoEngine.exportKeyToHex(key);
+    this.activeSaltHex = CryptoEngine.bufferToHex(saltBuffer);
+  },
+
+  /**
+   * Unlocks the vault with the master password.
+   * Returns true on success, false/throws on failure.
+   */
+  async unlock(masterPassword) {
+    if (!this.vaultExists()) {
+      throw new Error("No vault exists. Please create a vault first.");
+    }
+
+    // 1. Load salt and verifier payload
+    const saltBase64 = localStorage.getItem(this.STORAGE_KEYS.VAULT_SALT);
+    const saltBuffer = CryptoEngine.base64ToBuffer(saltBase64);
+    
+    const verifierJSON = localStorage.getItem(this.STORAGE_KEYS.VAULT_VERIFIER);
+    const verifier = JSON.parse(verifierJSON);
+
+    // 2. Derive key from master password
+    const key = await CryptoEngine.deriveKey(masterPassword, saltBuffer);
+
+    // 3. Attempt to decrypt the verifier token
+    try {
+      const decrypted = await CryptoEngine.decrypt(verifier.ciphertext, key, verifier.iv);
+      if (decrypted === "Vault Verified!") {
+        // Successful unlock
+        this.derivedKey = key;
+        this.isUnlocked = true;
+        this.rawDerivedKeyHex = await CryptoEngine.exportKeyToHex(key);
+        this.activeSaltHex = CryptoEngine.bufferToHex(saltBuffer);
+        return true;
+      } else {
+        return false;
+      }
+    } catch (e) {
+      // Decryption failure indicates wrong password
+      console.warn("Decryption failed during unlock. Wrong password.");
+      return false;
+    }
+  },
+
+  /**
+   * Locks the vault, purging keys from memory.
+   */
+  lock() {
+    this.derivedKey = null;
+    this.isUnlocked = false;
+    this.rawDerivedKeyHex = "";
+    this.activeSaltHex = "";
+  },
+
+  /**
+   * Permanently wipes the entire local vault.
+   */
+  destroyVault() {
+    localStorage.removeItem(this.STORAGE_KEYS.VAULT_SALT);
+    localStorage.removeItem(this.STORAGE_KEYS.VAULT_VERIFIER);
+    localStorage.removeItem(this.STORAGE_KEYS.VAULT_ITEMS);
+    this.lock();
+  },
+
+  // --- Credential Operations ---
+
+  /**
+   * Gets all items in the vault, decrypting their contents.
+   */
+  async getItems() {
+    if (!this.isUnlocked || !this.derivedKey) {
+      throw new Error("Vault is locked.");
+    }
+
+    const itemsJSON = localStorage.getItem(this.STORAGE_KEYS.VAULT_ITEMS) || "[]";
+    const encryptedItems = JSON.parse(itemsJSON);
+    const decryptedItems = [];
+
+    for (const item of encryptedItems) {
+      try {
+        const decryptedStr = await CryptoEngine.decrypt(
+          item.encData,
+          this.derivedKey,
+          item.iv
+        );
+        const data = JSON.parse(decryptedStr);
+        decryptedItems.push({
+          id: item.id,
+          category: item.category,
+          lastModified: item.lastModified,
+          ...data
+        });
+      } catch (err) {
+        console.error(`Failed to decrypt item ${item.id}:`, err);
+        // We include a placeholder for corruption, but don't crash
+        decryptedItems.push({
+          id: item.id,
+          category: item.category,
+          lastModified: item.lastModified,
+          title: "⚠️ [Decryption Failed - Damaged Item]",
+          username: "",
+          password: "",
+          website: "",
+          notes: ""
+        });
+      }
+    }
+
+    return decryptedItems;
+  },
+
+  /**
+   * Adds a new item to the vault.
+   */
+  async addItem(category, { title, username, password, website, notes }) {
+    if (!this.isUnlocked || !this.derivedKey) {
+      throw new Error("Vault is locked.");
+    }
+
+    const payload = JSON.stringify({ title, username, password, website, notes });
+    const iv = CryptoEngine.generateIV(12);
+
+    // 1. Encrypt detail payload
+    const encrypted = await CryptoEngine.encrypt(payload, this.derivedKey, iv);
+
+    // 2. Format database entry
+    const newItem = {
+      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+      category: category,
+      lastModified: new Date().toISOString(),
+      encData: encrypted.ciphertext,
+      iv: encrypted.iv
+    };
+
+    // 3. Save to database
+    const itemsJSON = localStorage.getItem(this.STORAGE_KEYS.VAULT_ITEMS) || "[]";
+    const items = JSON.parse(itemsJSON);
+    items.push(newItem);
+    localStorage.setItem(this.STORAGE_KEYS.VAULT_ITEMS, JSON.stringify(items));
+
+    return newItem;
+  },
+
+  /**
+   * Updates an existing item in the vault.
+   */
+  async updateItem(id, category, { title, username, password, website, notes }) {
+    if (!this.isUnlocked || !this.derivedKey) {
+      throw new Error("Vault is locked.");
+    }
+
+    const payload = JSON.stringify({ title, username, password, website, notes });
+    const iv = CryptoEngine.generateIV(12);
+
+    // 1. Encrypt new payload
+    const encrypted = await CryptoEngine.encrypt(payload, this.derivedKey, iv);
+
+    // 2. Load existing vault
+    const itemsJSON = localStorage.getItem(this.STORAGE_KEYS.VAULT_ITEMS) || "[]";
+    const items = JSON.parse(itemsJSON);
+
+    // 3. Find and replace
+    const index = items.findIndex(item => item.id === id);
+    if (index === -1) throw new Error("Item not found.");
+
+    items[index] = {
+      id: id,
+      category: category,
+      lastModified: new Date().toISOString(),
+      encData: encrypted.ciphertext,
+      iv: encrypted.iv
+    };
+
+    localStorage.setItem(this.STORAGE_KEYS.VAULT_ITEMS, JSON.stringify(items));
+  },
+
+  /**
+   * Deletes an item from the vault.
+   */
+  deleteItem(id) {
+    if (!this.isUnlocked) {
+      throw new Error("Vault is locked.");
+    }
+
+    const itemsJSON = localStorage.getItem(this.STORAGE_KEYS.VAULT_ITEMS) || "[]";
+    let items = JSON.parse(itemsJSON);
+    items = items.filter(item => item.id !== id);
+    localStorage.setItem(this.STORAGE_KEYS.VAULT_ITEMS, JSON.stringify(items));
+  },
+
+  /**
+   * Helper to get raw encryption variables for visualizer for a specific item.
+   */
+  async getEncryptionStepsForVisualizer(title, username, password, website, notes) {
+    if (!this.derivedKey) {
+      return null;
+    }
+
+    const payload = JSON.stringify({ title, username, password, website, notes });
+    const ivBuffer = CryptoEngine.generateIV(12);
+    const encrypted = await CryptoEngine.encrypt(payload, this.derivedKey, ivBuffer);
+    
+    return {
+      masterPasswordLength: "●".repeat(8), // Placeholder size, actual password hidden
+      saltHex: this.activeSaltHex,
+      derivedKeyHex: this.rawDerivedKeyHex,
+      plaintext: payload,
+      plaintextBytes: CryptoEngine.bufferToHex(CryptoEngine.stringToBuffer(payload)),
+      ivHex: CryptoEngine.bufferToHex(ivBuffer),
+      ciphertextBase64: encrypted.ciphertext,
+      ciphertextHex: CryptoEngine.bufferToHex(CryptoEngine.base64ToBuffer(encrypted.ciphertext))
+    };
+  },
+
+  // --- Security Audit Module ---
+
+  /**
+   * Run security audits on decrypted vault items.
+   */
+  async performAudit() {
+    const items = await this.getItems();
+    const result = {
+      total: 0,
+      veryWeak: 0,
+      weak: 0,
+      medium: 0,
+      strong: 0,
+      excellent: 0,
+      reused: {},
+      compromised: [], // simulated breached passwords
+      recommendations: []
+    };
+
+    const passwordCounts = {};
+
+    for (const item of items) {
+      if (item.category === "logins" && item.password) {
+        result.total++;
+        const entropy = CryptoEngine.calculateEntropy(item.password);
+        const strength = CryptoEngine.getEntropyStrength(entropy);
+
+        if (strength.score === 0) result.veryWeak++;
+        else if (strength.score === 1) result.weak++;
+        else if (strength.score === 2) result.medium++;
+        else if (strength.score === 3) result.strong++;
+        else if (strength.score === 4) result.excellent++;
+
+        // Track reused passwords
+        passwordCounts[item.password] = passwordCounts[item.password] || [];
+        passwordCounts[item.password].push(item.title || item.website || "Untitled Entry");
+
+        // Simulate breached passwords check (offline-friendly heuristic + mock breach)
+        // 1. Weak passwords (very weak) are simulated as compromised
+        // 2. Common passwords are mock compromised
+        const lowerPw = item.password.toLowerCase();
+        if (this.MOCK_BREACH_LIST.includes(lowerPw) || entropy < 30) {
+          result.compromised.push({
+            id: item.id,
+            title: item.title,
+            username: item.username,
+            password: item.password
+          });
+        }
+      }
+    }
+
+    // Populate reused password list
+    for (const [pw, accounts] of Object.entries(passwordCounts)) {
+      if (accounts.length > 1) {
+        result.reused[pw] = accounts;
+      }
+    }
+
+    // Build specific security recommendations
+    if (result.veryWeak + result.weak > 0) {
+      result.recommendations.push({
+        type: "danger",
+        title: "Weak Passwords Found",
+        desc: `You have ${result.veryWeak + result.weak} password(s) with weak entropy. Replace them with randomly generated passwords of at least 16 characters.`
+      });
+    }
+
+    const reusedCount = Object.values(result.reused).length;
+    if (reusedCount > 0) {
+      result.recommendations.push({
+        type: "warning",
+        title: "Reused Passwords Detected",
+        desc: `You are using the same password across ${reusedCount} different set(s) of credentials. Using the same password makes all accounts vulnerable if one is breached.`
+      });
+    }
+
+    if (result.compromised.length > 0) {
+      result.recommendations.push({
+        type: "danger",
+        title: "Compromised Passwords (Breach Simulation)",
+        desc: `${result.compromised.length} password(s) match common passwords found in standard wordlists and data leaks. Change them immediately.`
+      });
+    }
+
+    if (result.total > 0 && result.recommendations.length === 0) {
+      result.recommendations.push({
+        type: "success",
+        title: "Vault Secure",
+        desc: "Congratulations! All your passwords have strong entropy, there are no reuses, and none match common breached patterns."
+      });
+    }
+
+    return result;
+  },
+
+  // A local offline database of 50 common/compromised passwords for simulated security breaches.
+  MOCK_BREACH_LIST: [
+    "123456", "password", "123456789", "12345678", "12345", "qwerty", "password123", 
+    "admin", "1234567", "letmein", "123123", "charlie", "111111", "iloveyou", "password12",
+    "monkey", "trustnoone", "dragon", "baseball", "sunshine", "shadow", "cybersecurity", 
+    "master", "secret", "guest", "welcome", "hackme", "hunter2", "qwerty123", "p@ssword",
+    "password123!", "123456abc", "security", "root", "oracle", "system", "pass123"
+  ]
+};
+
+// Export for browser script usage
+window.VaultManager = VaultManager;
